@@ -12,6 +12,7 @@ pub struct ProjectRegistry;
 #[contractimpl]
 impl ProjectRegistry {
     pub fn initialize(env: Env, admin: Address, whitelister: Address) {
+        admin.require_auth();
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("already initialized");
         }
@@ -81,6 +82,10 @@ impl ProjectRegistry {
     pub fn update_impact_score(env: Env, project_id: u32, credit_quality: u32, green_impact: u32) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+
+        if credit_quality > 100 || green_impact > 100 {
+            panic!("scores must be 0-100");
+        }
 
         let mut project: ProjectData = env
             .storage()

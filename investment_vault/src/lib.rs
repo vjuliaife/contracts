@@ -19,6 +19,7 @@ pub struct InvestmentVault;
 #[contractimpl]
 impl InvestmentVault {
     pub fn initialize(env: Env, admin: Address, usdc_sac: Address, registry: Address) {
+        admin.require_auth();
         if env.storage().instance().has(&VaultKey::Admin) {
             panic!("already initialized");
         }

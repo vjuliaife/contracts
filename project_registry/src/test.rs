@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, Address, Env, String};
+use soroban_sdk::{testutils::Address as _, Address, Env, IntoVal, String};
 
 fn setup() -> (Env, Address, Address, ProjectRegistryClient<'static>) {
     let env = Env::default();
@@ -81,17 +81,37 @@ fn test_update_impact_score() {
 #[should_panic]
 fn test_update_score_non_admin_panics() {
     let env = Env::default();
-    // No mock_all_auths — admin auth will not be satisfied
-    let contract_id = env.register(ProjectRegistry, ());
-    let client = ProjectRegistryClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
     let whitelister = Address::generate(&env);
+    let creator = Address::generate(&env);
+
+    let contract_id = env.register(ProjectRegistry, ());
+    let client = ProjectRegistryClient::new(&env, &contract_id);
+
+    // Use mock_all_auths only for setup steps
     env.mock_all_auths();
     client.initialize(&admin, &whitelister);
-    // This should panic because project 1 doesn't exist
-    // (not because of missing auth — mock_all_auths is on)
-    // The real auth test: update on non-existent project panics with "project not found"
-    client.update_impact_score(&1u32, &50u32, &50u32);
+    client.set_whitelist(&creator, &true);
+    let id = client.create_project(&creator, &String::from_str(&env, "ipfs://Qm"));
+
+    // Provide auth for a non-admin address only — admin.require_auth() will fire and reject
+    let non_admin = Address::generate(&env);
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &non_admin,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "update_impact_score",
+            args: soroban_sdk::vec![
+                &env,
+                id.into_val(&env),
+                50u32.into_val(&env),
+                50u32.into_val(&env),
+            ],
+            sub_invokes: &[],
+        },
+    }]);
+    // Should panic: admin.require_auth() is not satisfied by non_admin's auth
+    client.update_impact_score(&id, &50u32, &50u32);
 }
 
 #[test]
