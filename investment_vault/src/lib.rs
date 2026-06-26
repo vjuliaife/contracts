@@ -1,13 +1,17 @@
 #![no_std]
 use soroban_sdk::{contract, contractimpl, Address, Env, MuxedAddress, String};
-
-/// Maximum single deposit: 1 billion USDC (7 decimals) — prevents i128 overflow
-/// in share calculations and caps single-user concentration risk (#112).
-const MAX_DEPOSIT: i128 = 1_000_000_000 * 10_000_000;
 use stellar_access::ownable::{set_owner, Ownable};
 use stellar_macros::only_owner;
 use stellar_tokens::fungible::burnable::FungibleBurnable;
 use stellar_tokens::fungible::{Base, FungibleToken};
+
+/// Maximum single deposit: 1 billion USDC (7 decimals) — prevents i128 overflow
+/// in share calculations and caps single-user concentration risk (#112).
+const MAX_DEPOSIT: i128 = 1_000_000_000 * 10_000_000;
+
+/// Scaling factor for the yield-per-share accumulator (#125).
+/// Large enough to preserve precision when total_shares >> yield amount.
+const YIELD_SCALE: i128 = 1_000_000_000_000_000_000; // 1e18
 
 mod events;
 mod types;
@@ -191,6 +195,99 @@ impl InvestmentVault {
 
         events::withdraw(&env, &from, shares_amount, usdc_returned);
         usdc_returned
+    }
+
+    // ── Yield distribution (#125) ──────────────────────────────────────────────
+
+    /// Deposit USDC yield into the vault and update the per-share accumulator.
+    /// Called by the owner when a project makes a repayment.
+    #[only_owner]
+    pub fn receive_yield(env: Env, from: Address, amount: i128) {
+        if amount <= 0 {
+            panic!("yield amount must be positive");
+        }
+        let total_shares = Base::total_supply(&env);
+        if total_shares == 0 {
+            panic!("no shares outstanding");
+        }
+
+        let usdc_sac: Address = env.storage().instance().get(&VaultKey::UsdcSac).unwrap();
+        soroban_sdk::token::TokenClient::new(&env, &usdc_sac).transfer(
+            &from,
+            &env.current_contract_address(),
+            &amount,
+        );
+
+        // Increase global accumulator: delta = amount * YIELD_SCALE / total_shares
+        let delta = amount * YIELD_SCALE / total_shares;
+        let accum: i128 = env
+            .storage()
+            .persistent()
+            .get(&VaultKey::YieldPerShareAccum)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&VaultKey::YieldPerShareAccum, &(accum + delta));
+
+        events::yield_received(&env, &from, amount);
+    }
+
+    /// Return the USDC yield claimable by `account` without modifying state.
+    pub fn claimable_yield(env: Env, account: Address) -> i128 {
+        let accum: i128 = env
+            .storage()
+            .persistent()
+            .get(&VaultKey::YieldPerShareAccum)
+            .unwrap_or(0);
+        let debt: i128 = env
+            .storage()
+            .persistent()
+            .get(&VaultKey::YieldDebt(account.clone()))
+            .unwrap_or(0);
+        let shares = Base::balance(&env, &account);
+        shares * (accum - debt) / YIELD_SCALE
+    }
+
+    /// Claim accumulated yield for `from`. Transfers claimable USDC to `from`.
+    pub fn claim_yield(env: Env, from: Address) -> i128 {
+        from.require_auth();
+        let accum: i128 = env
+            .storage()
+            .persistent()
+            .get(&VaultKey::YieldPerShareAccum)
+            .unwrap_or(0);
+        let debt: i128 = env
+            .storage()
+            .persistent()
+            .get(&VaultKey::YieldDebt(from.clone()))
+            .unwrap_or(0);
+        let shares = Base::balance(&env, &from);
+        let claimable = shares * (accum - debt) / YIELD_SCALE;
+
+        if claimable <= 0 {
+            return 0;
+        }
+
+        // Update debt checkpoint before transfer (CEI)
+        env.storage()
+            .persistent()
+            .set(&VaultKey::YieldDebt(from.clone()), &accum);
+
+        let usdc_sac: Address = env.storage().instance().get(&VaultKey::UsdcSac).unwrap();
+        let liquid = soroban_sdk::token::TokenClient::new(&env, &usdc_sac)
+            .balance(&env.current_contract_address());
+        if claimable > liquid {
+            panic!("insufficient liquid USDC for yield");
+        }
+
+        soroban_sdk::token::TokenClient::new(&env, &usdc_sac).transfer(
+            &env.current_contract_address(),
+            &from,
+            &claimable,
+        );
+
+        events::yield_claimed(&env, &from, claimable);
+        claimable
     }
 }
 

@@ -1,4 +1,5 @@
 use soroban_sdk::{contractevent, Address, Env, String};
+use crate::types::CertificationStatus;
 
 /// Emitted when a whitelisted creator registers a new project.
 #[contractevent]
@@ -26,6 +27,14 @@ pub struct WhitelistSet {
     pub status: bool,
 }
 
+/// Emitted when a project's certification status is updated (#130).
+#[contractevent]
+pub struct ProjectCertified {
+    #[topic]
+    pub project_id: u32,
+    pub status: CertificationStatus,
+}
+
 pub fn project_created(env: &Env, project_id: u32, owner: &Address, uri: &String) {
     ProjectCreated {
         project_id,
@@ -50,4 +59,8 @@ pub fn whitelist_set(env: &Env, account: &Address, status: bool) {
         status,
     }
     .publish(env);
+}
+
+pub fn project_certified(env: &Env, project_id: u32, status: CertificationStatus) {
+    ProjectCertified { project_id, status }.publish(env);
 }

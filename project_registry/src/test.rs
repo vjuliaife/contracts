@@ -26,13 +26,15 @@ fn test_create_project_by_whitelisted_address() {
 
     client.set_whitelist(&creator, &true);
 
-    let project_id = client.create_project(&creator, &String::from_str(&env, "ipfs://QmTest"));
+    let project_id = client.create_project(&creator, &String::from_str(&env, "ipfs://QmTest"), &0u64);
 
     assert_eq!(project_id, 1);
     let project = client.get_project(&1);
     assert_eq!(project.owner, creator);
     assert_eq!(project.credit_quality, 0);
     assert_eq!(project.green_impact, 0);
+    assert_eq!(project.maturity_date, 0);
+    assert_eq!(project.certification_status, CertificationStatus::None);
     assert_eq!(client.total_projects(), 1);
 }
 
@@ -41,7 +43,7 @@ fn test_create_project_by_whitelisted_address() {
 fn test_create_project_by_non_whitelisted_panics() {
     let (env, _admin, _whitelister, client) = setup();
     let creator = Address::generate(&env);
-    client.create_project(&creator, &String::from_str(&env, "ipfs://Qm"));
+    client.create_project(&creator, &String::from_str(&env, "ipfs://Qm"), &0u64);
 }
 
 #[test]
@@ -50,8 +52,8 @@ fn test_sequential_project_ids() {
     let creator = Address::generate(&env);
     client.set_whitelist(&creator, &true);
 
-    let id1 = client.create_project(&creator, &String::from_str(&env, "ipfs://Qm1"));
-    let id2 = client.create_project(&creator, &String::from_str(&env, "ipfs://Qm2"));
+    let id1 = client.create_project(&creator, &String::from_str(&env, "ipfs://Qm1"), &0u64);
+    let id2 = client.create_project(&creator, &String::from_str(&env, "ipfs://Qm2"), &0u64);
 
     assert_eq!(id1, 1);
     assert_eq!(id2, 2);
@@ -63,8 +65,24 @@ fn test_update_impact_score() {
     let (env, _admin, _whitelister, client) = setup();
     let creator = Address::generate(&env);
     client.set_whitelist(&creator, &true);
-    let id = client.create_project(&creator, &String::from_str(&env, "ipfs://Qm"));
+    let id = client.create_project(&creator, &String::from_str(&env, "ipfs://Qm"), &0u64);
 
+    client.update_impact_score(&id, &80u32, &90u32);
+
+    let project = client.get_project(&id);
+    assert_eq!(project.credit_quality, 80);
+    assert_eq!(project.green_impact, 90);
+}
+
+#[test]
+fn test_update_impact_score_noop_identical_values() {
+    let (env, _admin, _whitelister, client) = setup();
+    let creator = Address::generate(&env);
+    client.set_whitelist(&creator, &true);
+    let id = client.create_project(&creator, &String::from_str(&env, "ipfs://Qm"), &0u64);
+    client.update_impact_score(&id, &80u32, &90u32);
+
+    // Second call with identical scores should be a no-op (no panic, no storage write)
     client.update_impact_score(&id, &80u32, &90u32);
 
     let project = client.get_project(&id);
@@ -80,14 +98,12 @@ fn test_update_score_non_admin_panics() {
     let whitelister = Address::generate(&env);
     let creator = Address::generate(&env);
 
-    // Use mock_all_auths for setup steps
     env.mock_all_auths();
     let contract_id = env.register(ProjectRegistry, (&admin, &whitelister));
     let client = ProjectRegistryClient::new(&env, &contract_id);
     client.set_whitelist(&creator, &true);
-    let id = client.create_project(&creator, &String::from_str(&env, "ipfs://Qm"));
+    let id = client.create_project(&creator, &String::from_str(&env, "ipfs://Qm"), &0u64);
 
-    // Provide auth for a non-admin address only
     let non_admin = Address::generate(&env);
     env.mock_auths(&[soroban_sdk::testutils::MockAuth {
         address: &non_admin,
@@ -111,8 +127,8 @@ fn test_get_all_projects() {
     let (env, _admin, _whitelister, client) = setup();
     let creator = Address::generate(&env);
     client.set_whitelist(&creator, &true);
-    client.create_project(&creator, &String::from_str(&env, "ipfs://Qm1"));
-    client.create_project(&creator, &String::from_str(&env, "ipfs://Qm2"));
+    client.create_project(&creator, &String::from_str(&env, "ipfs://Qm1"), &0u64);
+    client.create_project(&creator, &String::from_str(&env, "ipfs://Qm2"), &0u64);
 
     let all = client.get_all_projects();
     assert_eq!(all.len(), 2);
@@ -125,6 +141,40 @@ fn test_get_all_projects() {
 fn test_update_impact_score_nonexistent_project_panics() {
     let (_env, _admin, _whitelister, client) = setup();
     client.update_impact_score(&999u32, &50u32, &50u32);
+}
+
+#[test]
+fn test_certify_project() {
+    let (env, _admin, whitelister, client) = setup();
+    let creator = Address::generate(&env);
+    client.set_whitelist(&creator, &true);
+    let id = client.create_project(&creator, &String::from_str(&env, "ipfs://Qm"), &0u64);
+
+    client.certify_project(&whitelister, &id, &CertificationStatus::Certified);
+
+    let project = client.get_project(&id);
+    assert_eq!(project.certification_status, CertificationStatus::Certified);
+}
+
+#[test]
+fn test_maturity_date_is_mature() {
+    let (env, _admin, _whitelister, client) = setup();
+    let creator = Address::generate(&env);
+    client.set_whitelist(&creator, &true);
+
+    // Set maturity 1000 seconds in future relative to current ledger time
+    let now = env.ledger().timestamp();
+    let id = client.create_project(
+        &creator,
+        &String::from_str(&env, "ipfs://Qm"),
+        &(now + 1000),
+    );
+
+    assert!(!client.is_mature(&id));
+
+    // Advance ledger past maturity
+    env.ledger().set_timestamp(now + 1001);
+    assert!(client.is_mature(&id));
 }
 
 // Integration: full Heliobond flow across both contracts
@@ -163,11 +213,12 @@ mod integration {
         let vault_id = env.register(vault_contract::WASM, (&admin, &usdc_sac, &registry_id));
         let vault = vault_contract::Client::new(&env, &vault_id);
 
-        // Create a project
+        // Create a project (no maturity date)
         registry.set_whitelist(&project_creator, &true);
         let project_id = registry.create_project(
             &project_creator,
             &String::from_str(&env, "ipfs://QmHeliobond"),
+            &0u64,
         );
         assert_eq!(project_id, 1);
 

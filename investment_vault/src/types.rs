@@ -1,4 +1,4 @@
-use soroban_sdk::contracttype;
+use soroban_sdk::{contracttype, Address};
 
 #[contracttype]
 pub enum VaultKey {
@@ -6,4 +6,8 @@ pub enum VaultKey {
     Registry,
     TotalInvestments,
     ProjectInvestment(u32),
+    /// Global yield-per-share accumulator, scaled by YIELD_SCALE (#125).
+    YieldPerShareAccum,
+    /// Per-shareholder checkpoint: yield-per-share value at last claim (#125).
+    YieldDebt(Address),
 }

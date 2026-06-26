@@ -11,7 +11,7 @@ const MIN_URI_LEN: u32 = 8;
 mod events;
 mod types;
 
-pub use types::{DataKey, ProjectData};
+pub use types::{CertificationStatus, DataKey, ProjectData};
 
 #[contract]
 pub struct ProjectRegistry;
@@ -37,7 +37,9 @@ impl ProjectRegistry {
         events::whitelist_set(&env, &account, status);
     }
 
-    pub fn create_project(env: Env, creator: Address, uri: String) -> u32 {
+    /// Create a new project. `maturity_date` is a Unix timestamp (seconds);
+    /// pass 0 to create an open-ended project (#127).
+    pub fn create_project(env: Env, creator: Address, uri: String, maturity_date: u64) -> u32 {
         creator.require_auth();
         let is_whitelisted: bool = env
             .storage()
@@ -55,6 +57,10 @@ impl ProjectRegistry {
         if uri_len > MAX_URI_LEN {
             panic!("uri too long");
         }
+        // Maturity date must be in the future if provided (#127)
+        if maturity_date > 0 && maturity_date <= env.ledger().timestamp() {
+            panic!("maturity date must be in the future");
+        }
 
         let counter: u32 = env
             .storage()
@@ -71,6 +77,8 @@ impl ProjectRegistry {
             uri: uri.clone(),
             credit_quality: 0,
             green_impact: 0,
+            maturity_date,
+            certification_status: CertificationStatus::None,
         };
 
         env.storage()
@@ -109,12 +117,51 @@ impl ProjectRegistry {
             .get(&DataKey::Project(project_id))
             .unwrap_or_else(|| panic!("project {} not found", project_id));
 
+        // Skip write and event if scores are identical (#124)
+        if project.credit_quality == credit_quality && project.green_impact == green_impact {
+            return;
+        }
+
         project.credit_quality = credit_quality;
         project.green_impact = green_impact;
         env.storage()
             .persistent()
             .set(&DataKey::Project(project_id), &project);
         events::project_updated(&env, project_id, credit_quality, green_impact);
+    }
+
+    /// Set the certification status of a project (whitelister or owner only) (#130).
+    pub fn certify_project(env: Env, caller: Address, project_id: u32, status: CertificationStatus) {
+        caller.require_auth();
+        let whitelister: Address = env.storage().instance().get(&DataKey::Whitelister).unwrap();
+        let owner: Address = stellar_access::ownable::get_owner(&env).unwrap();
+        if caller != whitelister && caller != owner {
+            panic!("not authorized to certify");
+        }
+        let mut project: ProjectData = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Project(project_id))
+            .unwrap_or_else(|| panic!("project not found"));
+        project.certification_status = status.clone();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Project(project_id), &project);
+        events::project_certified(&env, project_id, status);
+    }
+
+    /// Mark a project as settled once its maturity date has passed (#127).
+    /// Returns true if the project is mature and was settled, false if already past.
+    pub fn is_mature(env: Env, project_id: u32) -> bool {
+        let project: ProjectData = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Project(project_id))
+            .unwrap_or_else(|| panic!("project not found"));
+        if project.maturity_date == 0 {
+            return false;
+        }
+        env.ledger().timestamp() >= project.maturity_date
     }
 
     pub fn get_all_projects(env: Env) -> Vec<(u32, ProjectData)> {
