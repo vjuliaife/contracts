@@ -52,6 +52,25 @@ pub struct InsuranceClaimed {
     pub amount: i128,
 }
 
+/// Emitted when a withdrawal is queued because liquid USDC is insufficient (#3).
+/// Shares are burned immediately; USDC will be paid when claim() is called.
+#[contractevent]
+pub struct WithdrawQueued {
+    #[topic]
+    pub from: Address,
+    pub shares_burned: i128,
+    pub usdc_owed: i128,
+}
+
+/// Emitted when a queued redemption claim is settled by claim() (#3).
+#[contractevent]
+pub struct WithdrawClaimed {
+    #[topic]
+    pub to: Address,
+    pub usdc_paid: i128,
+    pub claim_index: u64,
+}
+
 pub fn deposit(env: &Env, from: &Address, usdc_amount: i128, shares_minted: i128) {
     Deposit {
         from: from.clone(),
@@ -92,6 +111,24 @@ pub fn insurance_claimed(env: &Env, project_id: u32, recipient: &Address, amount
         project_id,
         recipient: recipient.clone(),
         amount,
+    }
+    .publish(env);
+}
+
+pub fn withdraw_queued(env: &Env, from: &Address, shares_burned: i128, usdc_owed: i128) {
+    WithdrawQueued {
+        from: from.clone(),
+        shares_burned,
+        usdc_owed,
+    }
+    .publish(env);
+}
+
+pub fn withdraw_claimed(env: &Env, to: &Address, usdc_paid: i128, claim_index: u64) {
+    WithdrawClaimed {
+        to: to.clone(),
+        usdc_paid,
+        claim_index,
     }
     .publish(env);
 }

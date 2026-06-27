@@ -24,7 +24,7 @@ mod registry_interface {
     soroban_sdk::contractimport!(file = "../target/wasm32v1-none/release/project_registry.wasm");
 }
 
-pub use types::{HBSTokenInfo, PortfolioInfo, VaultKey};
+pub use types::{HBSTokenInfo, PortfolioInfo, QueuedClaim, VaultKey};
 
 /// Hard cap on the management fee to protect investors (#7).
 /// 500 bps = 5% maximum.
@@ -247,6 +247,23 @@ impl InvestmentVault {
             .balance(&env.current_contract_address());
 
         if usdc_returned > liquid {
+            // Insufficient liquidity: burn shares immediately (locking in the current USDC
+            // value) and enqueue a FIFO claim. call claim() once liquidity is restored.
+            Base::burn(&env, &from, shares_amount);
+            let tail: u64 = env
+                .storage()
+                .persistent()
+                .get(&VaultKey::QueueTail)
+                .unwrap_or(0);
+            env.storage().persistent().set(
+                &VaultKey::QueueEntry(tail),
+                &QueuedClaim { from: from.clone(), usdc_owed: usdc_returned },
+            );
+            env.storage()
+                .persistent()
+                .set(&VaultKey::QueueTail, &(tail + 1));
+            events::withdraw_queued(&env, &from, shares_amount, usdc_returned);
+            return 0;
             panic!("insufficient liquid USDC: funds may be deployed to projects");
         }
 
@@ -259,6 +276,66 @@ impl InvestmentVault {
 
         events::withdraw(&env, &from, shares_amount, usdc_returned);
         usdc_returned
+    }
+
+    /// Settle queued redemptions in FIFO order using available liquid USDC (#3).
+    ///
+    /// Stops at the head entry if it cannot be fully satisfied — available liquidity
+    /// is NOT used to pay out later, smaller entries. This preserves strict ordering
+    /// so no claimant can be skipped ahead of an earlier one.
+    ///
+    /// Anyone may call this function; no auth required.
+    pub fn claim(env: Env) -> i128 {
+        let head: u64 = env
+            .storage()
+            .persistent()
+            .get(&VaultKey::QueueHead)
+            .unwrap_or(0);
+        let tail: u64 = env
+            .storage()
+            .persistent()
+            .get(&VaultKey::QueueTail)
+            .unwrap_or(0);
+
+        if head == tail {
+            return 0; // queue is empty
+        }
+
+        let usdc_sac: Address = env.storage().instance().get(&VaultKey::UsdcSac).unwrap();
+        let mut liquid = soroban_sdk::token::TokenClient::new(&env, &usdc_sac)
+            .balance(&env.current_contract_address());
+        let mut total_paid: i128 = 0;
+        let mut idx = head;
+
+        while idx < tail && liquid > 0 {
+            let entry: QueuedClaim = env
+                .storage()
+                .persistent()
+                .get(&VaultKey::QueueEntry(idx))
+                .unwrap_or_else(|| panic!("queue entry missing"));
+
+            if entry.usdc_owed > liquid {
+                break; // can't fully satisfy this entry yet; preserve FIFO order
+            }
+
+            // CEI: remove from storage before the external transfer
+            env.storage().persistent().remove(&VaultKey::QueueEntry(idx));
+            liquid -= entry.usdc_owed;
+            total_paid += entry.usdc_owed;
+            idx += 1;
+
+            soroban_sdk::token::TokenClient::new(&env, &usdc_sac).transfer(
+                &env.current_contract_address(),
+                &entry.from,
+                &entry.usdc_owed,
+            );
+            events::withdraw_claimed(&env, &entry.from, entry.usdc_owed, idx - 1);
+        }
+
+        if idx != head {
+            env.storage().persistent().set(&VaultKey::QueueHead, &idx);
+        }
+        total_paid
     }
 
     // ── Yield distribution (#125) ──────────────────────────────────────────────

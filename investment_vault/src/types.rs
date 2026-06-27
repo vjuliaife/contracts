@@ -22,6 +22,12 @@ pub enum VaultKey {
     ManagementFeeRecipient,
     /// Whether secondary market trading of HBS is active (#126).
     TradingEnabled,
+    /// Index of the oldest unprocessed redemption queue entry (#3).
+    QueueHead,
+    /// Next free index in the redemption queue (#3).
+    QueueTail,
+    /// A queued redemption claim by index (#3).
+    QueueEntry(u64),
 }
 
 /// Metadata returned for DEX listing and secondary market integration (#126).
@@ -36,6 +42,16 @@ pub struct HBSTokenInfo {
     pub decimals: u32,
     /// Whether the admin has enabled secondary trading.
     pub trading_enabled: bool,
+}
+
+/// A pending withdrawal claim created when vault liquidity is insufficient (#3).
+/// Shares are burned immediately at enqueue; this records the fixed USDC owed.
+#[contracttype]
+pub struct QueuedClaim {
+    /// Address that will receive the USDC when liquidity is available.
+    pub from: Address,
+    /// USDC amount owed, fixed at the share price when the withdrawal was requested.
+    pub usdc_owed: i128,
 }
 
 /// On-chain portfolio snapshot for a single investor (#132).

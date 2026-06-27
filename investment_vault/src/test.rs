@@ -1,6 +1,6 @@
 #![cfg(test)]
 use super::*;
-use soroban_sdk::{testutils::Address as _, token::StellarAssetClient, Address, Env, String};
+use soroban_sdk::{testutils::Address as _, token::StellarAssetClient, token::TokenClient, Address, Env, String};
 
 mod registry_contract {
     soroban_sdk::contractimport!(file = "../target/wasm32v1-none/release/project_registry.wasm");
@@ -53,10 +53,17 @@ fn mint_usdc(env: &Env, usdc_sac: &Address, to: &Address, amount: i128) {
 fn test_first_deposit_mints_1_to_1_shares() {
     let s = setup();
     let investor = Address::generate(&s.env);
-    mint_usdc(&s.env, &s.usdc_sac, &investor, 1_000_0000000i128);
+    let amount = 1_000_0000000i128;
+    mint_usdc(&s.env, &s.usdc_sac, &investor, amount);
 
-    let shares = s.vault_client.deposit(&investor, &1_000_0000000i128);
+    let shares = s.vault_client.deposit(&investor, &amount);
 
+    // Deposit deducts a 50-bps insurance premium before share calculation.
+    // First deposit is 1:1 on the investable amount (after premium).
+    let investable = amount - amount * 50 / 10_000; // 9_950_000_000
+    assert_eq!(shares, investable);
+    assert_eq!(s.vault_client.balance(&investor), investable);
+    assert_eq!(s.vault_client.total_supply(), investable);
     // 0.5% insurance premium is deducted before share conversion:
     // investable = 1000 - 5 = 995 USDC → 995 shares at 1:1
     assert_eq!(shares, 995_0000000i128);
@@ -69,6 +76,18 @@ fn test_deposit_proportional_after_first() {
     let s = setup();
     let investor1 = Address::generate(&s.env);
     let investor2 = Address::generate(&s.env);
+    let amount = 1_000_0000000i128;
+    mint_usdc(&s.env, &s.usdc_sac, &investor1, amount);
+    mint_usdc(&s.env, &s.usdc_sac, &investor2, amount);
+
+    s.vault_client.deposit(&investor1, &amount);
+    let shares2 = s.vault_client.deposit(&investor2, &amount);
+
+    // After investor1: total_shares = investable, total_assets = amount (full deposit in vault).
+    // investor2's investable amount buys shares at the current NAV price.
+    let investable = amount - amount * 50 / 10_000; // 9_950_000_000
+    let expected_shares2 = investable * investable / amount; // 9_900_250_000
+    assert_eq!(shares2, expected_shares2);
     mint_usdc(&s.env, &s.usdc_sac, &investor1, 1_000_0000000i128);
     mint_usdc(&s.env, &s.usdc_sac, &investor2, 1_000_0000000i128);
 
@@ -322,4 +341,126 @@ fn test_get_hbs_token_info_after_trading_enabled() {
     s.vault_client.enable_secondary_trading();
     let info = s.vault_client.get_hbs_token_info();
     assert!(info.trading_enabled);
+}
+
+// ── Property tests (#2) ────────────────────────────────────────────────────────
+
+#[test]
+fn test_conversion_empty_vault_is_1_to_1() {
+    let s = setup();
+    // On an empty vault, convert_to_shares is 1:1 and convert_to_assets returns 0
+    // because there are no shares outstanding to redeem against.
+    for amount in [1i128, 100, 1_0000000, 100_0000000, 1_000_0000000] {
+        assert_eq!(s.vault_client.convert_to_shares(&amount), amount);
+        assert_eq!(s.vault_client.convert_to_assets(&amount), 0);
+    }
+}
+
+#[test]
+fn test_conversion_roundtrip_never_favors_withdrawer() {
+    // Property: floor division must never give back more than the input amount,
+    // and the loss must be at most 1 stroop.
+    //
+    // Precondition: holds for any A/S ratio < 2 (i.e., total_assets < 2 * total_shares).
+    // After one standard deposit the ratio is ~1.005, well within this bound.
+    let s = setup();
+    let anchor = Address::generate(&s.env);
+    mint_usdc(&s.env, &s.usdc_sac, &anchor, 1_000_0000000i128);
+    s.vault_client.deposit(&anchor, &1_000_0000000i128);
+
+    let test_amounts = [1i128, 3, 7, 1_0000000, 100_0000000, 999_9999999, 1_000_0000000];
+    for &amount in test_amounts.iter() {
+        let shares = s.vault_client.convert_to_shares(&amount);
+        let assets = s.vault_client.convert_to_assets(&shares);
+        assert!(
+            assets <= amount,
+            "rounding favored withdrawer: amount={} assets={}",
+            amount, assets
+        );
+        assert!(
+            amount - assets <= 1,
+            "roundtrip loss > 1 stroop: amount={} assets={}",
+            amount, assets
+        );
+    }
+}
+
+#[test]
+fn test_conversion_roundtrip_first_deposit_exact() {
+    // On an empty vault the first convert_to_shares call is exactly 1:1.
+    let s = setup();
+    for amount in [1i128, 1_0000000, 500_0000000, 1_000_0000000] {
+        assert_eq!(s.vault_client.convert_to_shares(&amount), amount);
+    }
+}
+
+// ── Redemption queue tests (#3) ────────────────────────────────────────────────
+
+#[test]
+fn test_withdraw_enqueues_when_insufficient_liquidity() {
+    let s = setup();
+    let investor = Address::generate(&s.env);
+    let deposit_amount = 1_000_0000000i128;
+    mint_usdc(&s.env, &s.usdc_sac, &investor, deposit_amount);
+    let shares = s.vault_client.deposit(&investor, &deposit_amount);
+
+    // Create a project and fund it, draining roughly half the vault's liquid USDC.
+    let registry_client = registry_contract::Client::new(&s.env, &s.registry);
+    let creator = Address::generate(&s.env);
+    registry_client.set_whitelist(&creator, &true);
+    let project_id = registry_client.create_project(
+        &creator,
+        &String::from_str(&s.env, "ipfs://test"),
+        &0u64,
+    );
+    s.vault_client.fund_project(&project_id, &500_0000000i128);
+
+    // Shares are worth deposit_amount USDC but only 500 USDC is liquid — should enqueue.
+    let returned = s.vault_client.withdraw(&investor, &shares);
+
+    assert_eq!(returned, 0); // queued, not immediate
+    assert_eq!(s.vault_client.balance(&investor), 0); // shares burned at enqueue
+    // Investor still has no USDC (claim not settled yet)
+    assert_eq!(
+        TokenClient::new(&s.env, &s.usdc_sac).balance(&investor),
+        0
+    );
+}
+
+#[test]
+fn test_claim_settles_queued_redemption() {
+    let s = setup();
+    let investor1 = Address::generate(&s.env);
+    let deposit_amount = 1_000_0000000i128;
+    mint_usdc(&s.env, &s.usdc_sac, &investor1, deposit_amount);
+    let shares = s.vault_client.deposit(&investor1, &deposit_amount);
+
+    // Drain ~half the vault to create an insufficiency.
+    let registry_client = registry_contract::Client::new(&s.env, &s.registry);
+    let creator = Address::generate(&s.env);
+    registry_client.set_whitelist(&creator, &true);
+    let project_id = registry_client.create_project(
+        &creator,
+        &String::from_str(&s.env, "ipfs://test"),
+        &0u64,
+    );
+    s.vault_client.fund_project(&project_id, &500_0000000i128);
+
+    // Queue the withdrawal.
+    let owed = s.vault_client.convert_to_assets(&shares);
+    s.vault_client.withdraw(&investor1, &shares);
+
+    // Add liquidity: second investor deposits enough to cover the queued claim.
+    let investor2 = Address::generate(&s.env);
+    mint_usdc(&s.env, &s.usdc_sac, &investor2, 2_000_0000000i128);
+    s.vault_client.deposit(&investor2, &2_000_0000000i128);
+
+    // Settle the queue.
+    let paid = s.vault_client.claim();
+
+    assert_eq!(paid, owed);
+    assert_eq!(
+        TokenClient::new(&s.env, &s.usdc_sac).balance(&investor1),
+        owed
+    );
 }

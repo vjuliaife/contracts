@@ -106,7 +106,8 @@ Sets the `Ownable` owner to `admin`, stores USDC SAC and Registry addresses, ini
 | Function | Auth required | Description |
 |---|---|---|
 | `deposit(from, usdc_amount)` | `from` | Transfer USDC from investor into vault; mint HBS shares; return shares minted |
-| `withdraw(from, shares_amount)` | `from` (via `Base::burn`) | Burn HBS shares; transfer proportional liquid USDC back to investor; return USDC returned |
+| `withdraw(from, shares_amount)` | `from` (via `Base::burn`) | Burn HBS shares; if liquid USDC covers the redemption transfer it immediately; otherwise enqueue a FIFO claim and return 0 |
+| `claim()` | none | Settle queued redemptions in FIFO order using available liquid USDC; return total USDC paid out |
 | `fund_project(project_id, amount)` | `Admin` (`#[only_owner]`) | Cross-call Registry to resolve project owner; transfer USDC from vault to owner; record investment |
 | `total_assets()` | none | Return `liquid_USDC + total_investments + expected_returns` |
 | `convert_to_shares(usdc_amount)` | none | Preview how many HBS a given USDC deposit would mint |
@@ -170,7 +171,7 @@ make test
 
 ## Deploy to Testnet
 
-The two contracts must be deployed in order because `InvestmentVault` takes the registry contract ID as a constructor argument.
+Set the following environment variables then run `make deploy-testnet`:
 
 ```bash
 export STELLAR_SECRET_KEY=S...       # deployer secret key
@@ -178,31 +179,57 @@ export ADMIN_ADDRESS=G...            # admin/owner address
 export WHITELISTER_ADDRESS=G...      # whitelister address
 export USDC_SAC_ADDRESS=G...         # USDC Stellar Asset Contract on testnet
 
-# 1. Deploy ProjectRegistry
-REGISTRY_ID=$(stellar contract deploy \
-  --wasm target/wasm32v1-none/release/project_registry.wasm \
-  --source "$STELLAR_SECRET_KEY" \
-  --network testnet \
-  -- \
-  --admin "$ADMIN_ADDRESS" \
-  --whitelister "$WHITELISTER_ADDRESS")
-
-echo "Registry: $REGISTRY_ID"
-
-# 2. Deploy InvestmentVault (references the registry deployed above)
-VAULT_ID=$(stellar contract deploy \
-  --wasm target/wasm32v1-none/release/investment_vault.wasm \
-  --source "$STELLAR_SECRET_KEY" \
-  --network testnet \
-  -- \
-  --admin "$ADMIN_ADDRESS" \
-  --usdc_sac "$USDC_SAC_ADDRESS" \
-  --registry "$REGISTRY_ID")
-
-echo "Vault: $VAULT_ID"
+make deploy-testnet
 ```
 
-The `Makefile` target `make deploy-testnet` runs the same two steps using the environment variables `STELLAR_SECRET_KEY`, `ADMIN_ADDRESS`, `WHITELISTER_ADDRESS`, `USDC_SAC_ADDRESS`, and `REGISTRY_CONTRACT_ID`.
+The command builds both contracts, deploys `ProjectRegistry` first, captures its contract ID, then deploys `InvestmentVault` wiring it to the registry. Both contract IDs are printed to the terminal and written to **`deploy/testnet.json`**:
+
+```json
+{
+  "network": "testnet",
+  "project_registry": "C...",
+  "investment_vault": "C..."
+}
+```
+
+`deploy/testnet.json` is checked into the repository as a placeholder; `make deploy-testnet` overwrites it with the real IDs after each deployment.
+
+---
+
+## Events Reference
+
+Every state-changing function emits a structured event. Topics are indexed by the network and usable as Horizon event filters; data fields carry the full payload.
+
+### InvestmentVault
+
+| Event | Topics | Data | Emitted by |
+|---|---|---|---|
+| `Deposit` | `from` (Address) | `usdc_amount`, `shares_minted` (i128) | `deposit()` |
+| `Withdraw` | `from` (Address) | `shares_burned`, `usdc_returned` (i128) | `withdraw()` — immediate path |
+| `WithdrawQueued` | `from` (Address) | `shares_burned`, `usdc_owed` (i128) | `withdraw()` — queued path (insufficient liquidity) |
+| `WithdrawClaimed` | `to` (Address) | `usdc_paid` (i128), `claim_index` (u64) | `claim()` |
+| `ProjectFunded` | `project_id` (u32) | `amount` (i128), `recipient` (Address) | `fund_project()` |
+| `YieldReceived` | `from` (Address) | `amount` (i128) | `receive_yield()` |
+| `YieldClaimed` | `to` (Address) | `amount` (i128) | `claim_yield()` |
+| `InsuranceClaimed` | `project_id` (u32) | `recipient` (Address), `amount` (i128) | `claim_insurance()` |
+| `OwnershipTransfer` | (library) | `new_owner` (Address) | `transfer_ownership()` — emitted by `stellar-access` |
+| `OwnershipTransferCompleted` | (library) | `new_owner` (Address) | `accept_ownership()` — emitted by `stellar-access` |
+| `OwnershipRenounced` | (library) | — | `renounce_ownership()` — emitted by `stellar-access` |
+
+### ProjectRegistry
+
+| Event | Topics | Data | Emitted by |
+|---|---|---|---|
+| `ProjectCreated` | `project_id` (u32) | `owner` (Address), `uri` (String) | `create_project()` |
+| `ProjectUpdated` | `project_id` (u32) | `credit_quality`, `green_impact` (u32) | `update_impact_score()` (only when values change) |
+| `WhitelistSet` | `account` (Address) | `status` (bool) | `set_whitelist()` |
+| `ProjectCertified` | `project_id` (u32) | `status` (CertificationStatus) | `certify_project()` |
+| `ProposalCreated` | `proposal_id` (u32) | `proposer` (Address), `voting_ends_at` (u64) | `create_proposal()` |
+| `VoteCast` | `proposal_id` (u32) | `voter` (Address), `support` (bool), `weight` (i128) | `cast_vote()` |
+| `ProposalExecuted` | `proposal_id` (u32) | `passed` (bool) | `execute_proposal()` |
+| `OwnershipTransfer` | (library) | `new_owner` (Address) | `transfer_ownership()` — emitted by `stellar-access` |
+| `OwnershipTransferCompleted` | (library) | `new_owner` (Address) | `accept_ownership()` — emitted by `stellar-access` |
+| `OwnershipRenounced` | (library) | — | `renounce_ownership()` — emitted by `stellar-access` |
 
 ---
 
