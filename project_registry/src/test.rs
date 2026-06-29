@@ -4,9 +4,8 @@ extern crate std;
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger as _},
-
+    Address, Env, IntoVal, String,
 };
-extern crate std;
 
 mod vault_contract {
     soroban_sdk::contractimport!(file = "../target/wasm32v1-none/release/investment_vault.wasm");
@@ -568,8 +567,6 @@ fn test_score_changed_event_contains_old_and_new_values() {
     let id = client.create_project(&creator, &String::from_str(&env, "ipfs://Qm"), &0u64);
 
     client.update_impact_score(&id, &80u32, &60u32);
-
-
 }
 
 #[test]
@@ -838,7 +835,7 @@ mod integration {
         // total_assets = 2350, total_supply = 1990
         // returned = 995 * 2350 / 1990 = 1175 USDC (insurance pool is part of total assets)
         let half_shares = shares / 2;
-        let returned = vault.withdraw(&investor, &half_shares);
+        let returned = vault.withdraw(&investor, &half_shares, &0);
         assert_eq!(returned, 11_750_000_000i128);
 
         // Remaining shares = half of investable

@@ -132,6 +132,14 @@
                 "map": [
                   {
                     "key": {
+                      "symbol": "archived"
+                    },
+                    "val": {
+                      "bool": false
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "certification_status"
                     },
                     "val": {
@@ -152,6 +160,14 @@
                     },
                     "val": {
                       "u32": 0
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "last_update_timestamp"
+                    },
+                    "val": {
+                      "u64": "0"
                     }
                   },
                   {
@@ -208,6 +224,14 @@
                 "map": [
                   {
                     "key": {
+                      "symbol": "archived"
+                    },
+                    "val": {
+                      "bool": false
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "certification_status"
                     },
                     "val": {
@@ -228,6 +252,14 @@
                     },
                     "val": {
                       "u32": 0
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "last_update_timestamp"
+                    },
+                    "val": {
+                      "u64": "0"
                     }
                   },
                   {
@@ -338,6 +370,18 @@
                       },
                       "val": {
                         "u32": 0
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "StateVersion"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u32": 1
                       }
                     },
                     {

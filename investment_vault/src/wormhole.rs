@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Wormhole cross-chain bridge integration types and helpers.
 //!
 //! Wormhole integration uses a burn/mint pattern:
@@ -14,7 +15,6 @@
 
 use soroban_sdk::xdr::{FromXdr, ToXdr};
 use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env};
-
 
 pub mod chain_id {
     #![allow(dead_code)]
@@ -68,7 +68,12 @@ pub trait BridgeInterface {
 
     /// Initiate a cross-chain transfer. Burns `amount` of the local token
     /// and emits a bridge event for relayers to pick up.
-    fn initiate_transfer(env: Env, from: Address, amount: i128, recipient: CrossChainAddress) -> u64;
+    fn initiate_transfer(
+        env: Env,
+        from: Address,
+        amount: i128,
+        recipient: CrossChainAddress,
+    ) -> u64;
 
     /// Complete an incoming cross-chain transfer. Verifies the VAA/message,
     /// authenticates the emitter, and mints tokens to the recipient.

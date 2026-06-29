@@ -1,5 +1,5 @@
 use crate::types::CertificationStatus;
-use soroban_sdk::{contractevent, vec, Address, Env, String, Symbol};
+use soroban_sdk::{contractevent, Address, Env, Symbol};
 
 /// Emitted when collateral is deposited for a project (#128).
 #[contractevent]
@@ -131,6 +131,7 @@ pub fn project_updated(env: &Env, project_id: u32, credit_quality: u32, green_im
     .publish(env);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn score_changed(
     env: &Env,
     project_id: u32,
@@ -161,18 +162,16 @@ pub fn whitelist_set(env: &Env, account: &Address, status: bool) {
     .publish(env);
 }
 
+#[allow(deprecated)]
 pub fn project_archived(env: &Env, project_id: u32) {
-    env.events().publish(
-        (Symbol::new(env, "project_archived"),),
-        project_id,
-    );
+    env.events()
+        .publish((Symbol::new(env, "project_archived"),), project_id);
 }
 
+#[allow(deprecated)]
 pub fn project_deleted(env: &Env, project_id: u32) {
-    env.events().publish(
-        (Symbol::new(env, "project_deleted"),),
-        project_id,
-    );
+    env.events()
+        .publish((Symbol::new(env, "project_deleted"),), project_id);
 }
 
 pub fn project_certified(env: &Env, project_id: u32, status: CertificationStatus) {

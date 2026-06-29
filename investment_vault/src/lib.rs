@@ -4,7 +4,7 @@
 //! ## Cross-Contract Trust Boundaries (#22)
 //!
 //! This contract makes cross-contract calls to the ProjectRegistry via the imported WASM interface.
-//! 
+//!
 //! ### Trust Assumptions:
 //! - The vault trusts the registry to return valid ProjectData with legitimate owner addresses
 //! - The vault trusts the registry's total_projects() return value for iteration
@@ -66,6 +66,7 @@ const YIELD_SCALE: i128 = 1_000_000_000_000_000_000; // 1e18
 /// 50 bps = 0.5 % of deposit amount.
 const INSURANCE_PREMIUM_BPS: i128 = 50;
 const MAX_MULTISIG_SIGNERS: u32 = 10;
+const STATE_VERSION: u32 = 1;
 
 mod composability;
 mod events;
@@ -127,7 +128,7 @@ pub const CONTRACT_DESCRIPTION: &str = "Heliobond Investment Vault";
 pub const CONTRACT_VERSION: &str = "1.0.0";
 
 /// State schema version for this contract build. Increment when a migration is required.
-const STATE_VERSION: u32 = 1;
+
 
 #[contract]
 pub struct InvestmentVault;
@@ -145,6 +146,9 @@ impl InvestmentVault {
         // Validate that registry is a deployed ProjectRegistry contract by calling it.
         // This panics at construction time if the address is invalid.
         registry_interface::Client::new(&env, &registry).total_projects();
+        // Validate that usdc_sac is a valid SAC.
+        soroban_sdk::token::TokenClient::new(&env, &usdc_sac)
+            .balance(&env.current_contract_address());
         env.storage()
             .instance()
             .set(&VaultKey::StateVersion, &STATE_VERSION);
@@ -208,6 +212,7 @@ impl InvestmentVault {
     /// `ProjectRegistry`, not to an arbitrary address.
     #[only_owner]
     pub fn fund_project(env: Env, project_id: u32, amount: i128) {
+        require_not_paused(&env);
         require_multisig_disabled(&env);
         fund_project_internal(env, project_id, amount);
     }
@@ -227,13 +232,11 @@ impl InvestmentVault {
         for funding in fundings.iter() {
             fund_project_internal(env.clone(), funding.0, funding.1);
         }
-
     }
 
     /// Return cached expected returns — updated incrementally on `fund_project` (#81).
     /// Use `refresh_expected_returns` to manually recompute from scratch.
     pub fn get_expected_returns(env: Env) -> i128 {
-
         let registry_addr: Address = env.storage().instance().get(&VaultKey::Registry).unwrap();
         let registry = registry_interface::Client::new(&env, &registry_addr);
         let total_projects = registry.total_projects();
@@ -260,7 +263,6 @@ impl InvestmentVault {
     /// Use `refresh_total_assets` to recompute from scratch if the cache
     /// may be stale (e.g., after a direct USDC transfer to the vault address).
     pub fn total_assets(env: Env) -> i128 {
-
         let usdc_sac: Address = env.storage().instance().get(&VaultKey::UsdcSac).unwrap();
         let liquid = soroban_sdk::token::TokenClient::new(&env, &usdc_sac)
             .balance(&env.current_contract_address());
@@ -314,6 +316,7 @@ impl InvestmentVault {
     ///
     /// The remaining investable amount is converted to shares at the current NAV.
     pub fn deposit(env: Env, from: Address, usdc_amount: i128) -> i128 {
+        require_not_paused(&env);
         require_current_state(&env);
         from.require_auth();
         if usdc_amount <= 0 {
@@ -426,7 +429,8 @@ impl InvestmentVault {
     /// (see `get_utilization_bps`). If the vault has insufficient liquid USDC to pay
     /// the full redemption, shares are burned immediately and the claim is enqueued
     /// in FIFO order — call `claim()` once liquidity is restored.
-    pub fn withdraw(env: Env, from: Address, shares_amount: i128) -> i128 {
+    pub fn withdraw(env: Env, from: Address, shares_amount: i128, min_usdc_return: i128) -> i128 {
+        require_not_paused(&env);
         require_current_state(&env);
         // Note: from.require_auth() is called inside Base::burn
         if shares_amount <= 0 {
@@ -459,6 +463,9 @@ impl InvestmentVault {
         }
         if usdc_returned > max_withdraw {
             panic_with_error!(&env, VaultError::WithdrawalExceedsLimit);
+        }
+        if usdc_returned < min_usdc_return {
+            panic_with_error!(&env, VaultError::SlippageLimitExceeded);
         }
 
         if usdc_returned > liquid {
@@ -745,8 +752,6 @@ impl InvestmentVault {
             .set(&VaultKey::MultiSigThreshold, &threshold);
     }
 
-
-
     pub fn get_multisig_admin(env: Env) -> (Vec<Address>, u32) {
         let signers = env
             .storage()
@@ -979,11 +984,10 @@ impl InvestmentVault {
     #[only_owner]
     pub fn set_trusted_emitter(
         env: Env,
-        chain_id: u32,
-        emitter_address: BytesN<32>,
-        trusted: bool,
+        _chain_id: u32,
+        _emitter_address: BytesN<32>,
+        _trusted: bool,
     ) {
-
     }
 
     pub fn initiate_bridge_transfer(
@@ -1640,6 +1644,37 @@ fn require_current_state(env: &Env) {
     }
 }
 
+fn require_not_paused(env: &Env) {
+    let paused: bool = env
+        .storage()
+        .instance()
+        .get(&VaultKey::Paused)
+        .unwrap_or(false);
+    if paused {
+        panic_with_error!(env, VaultError::Paused);
+    }
+}
+
+#[contractimpl]
+impl InvestmentVault {
+    #[only_owner]
+    pub fn pause(env: Env) {
+        env.storage().instance().set(&VaultKey::Paused, &true);
+        events::paused(&env);
+    }
+
+    #[only_owner]
+    pub fn unpause(env: Env) {
+        env.storage().instance().set(&VaultKey::Paused, &false);
+        events::unpaused(&env);
+    }
+
+    #[only_owner]
+    pub fn upgrade(env: Env, new_wasm_hash: soroban_sdk::BytesN<32>) {
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        // events::upgraded(&env) could be called here if needed
+    }
+}
 #[contractimpl(contracttrait)]
 impl FungibleToken for InvestmentVault {
     type ContractType = Base;

@@ -28,6 +28,7 @@ pub use types::{CertificationStatus, DataKey, ProjectData, Proposal, RegistryErr
 const MIN_VOTING_PERIOD: u64 = 86_400;
 
 /// Minimum oracle update interval in seconds (1 hour).
+#[allow(dead_code)]
 const MIN_UPDATE_INTERVAL: u64 = 3600;
 
 pub const CONTRACT_NAME: &str = "Project Registry";
@@ -200,9 +201,11 @@ impl ProjectRegistry {
             .persistent()
             .get(&DataKey::Project(project_id))
             .unwrap_or_else(|| panic_with_error!(&env, RegistryError::ProjectNotFound));
-        
+
         project.archived = true;
-        env.storage().persistent().set(&DataKey::Project(project_id), &project);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Project(project_id), &project);
         events::project_archived(&env, project_id);
     }
 
@@ -217,11 +220,13 @@ impl ProjectRegistry {
             .persistent()
             .get(&DataKey::Project(project_id))
             .unwrap_or_else(|| panic_with_error!(&env, RegistryError::ProjectNotFound));
-        
+
         // NOTE: In production, should verify no investments via vault.get_project_investment(project_id)
         // For now, we allow deletion assuming caller has verified no active investments
-        
-        env.storage().persistent().remove(&DataKey::Project(project_id));
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Project(project_id));
         events::project_deleted(&env, project_id);
     }
 
@@ -306,7 +311,6 @@ impl ProjectRegistry {
 
     /// Return all registered projects as `(project_id, ProjectData)` pairs.
     /// Iterates IDs 1..=`total_projects()` — O(n) in the number of projects.
-
     pub fn get_all_projects(env: Env) -> Vec<(u32, ProjectData)> {
         require_current_state(&env);
         let counter: u32 = env
@@ -720,6 +724,11 @@ impl ProjectRegistry {
         require_current_state(&env);
         env.storage().instance().get(&DataKey::Whitelister).unwrap()
     }
+
+    #[only_owner]
+    pub fn upgrade(env: Env, new_wasm_hash: soroban_sdk::BytesN<32>) {
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+    }
 }
 
 fn update_impact_score_internal(env: Env, project_id: u32, credit_quality: u32, green_impact: u32) {
@@ -761,6 +770,7 @@ fn update_impact_score_internal(env: Env, project_id: u32, credit_quality: u32, 
     );
 }
 
+#[allow(dead_code)]
 fn update_credit_quality_score_internal(env: Env, project_id: u32, credit_quality: u32) {
     if credit_quality > 100 {
         panic_with_error!(&env, RegistryError::CreditQualityOutOfRange);

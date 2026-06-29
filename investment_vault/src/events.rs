@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use soroban_sdk::{contractevent, Address, BytesN, Env, String};
 
 /// Emitted when an investor deposits USDC and receives vault shares.
@@ -17,6 +18,13 @@ pub struct Withdraw {
     pub shares_burned: i128,
     pub usdc_returned: i128,
 }
+/// Emitted when the vault is paused.
+#[contractevent]
+pub struct Paused {}
+
+/// Emitted when the vault is unpaused.
+#[contractevent]
+pub struct Unpaused {}
 
 /// Emitted when the vault funds a registered project.
 #[contractevent]
@@ -87,6 +95,14 @@ pub fn withdraw(env: &Env, from: &Address, shares_burned: i128, usdc_returned: i
         usdc_returned,
     }
     .publish(env);
+}
+
+pub fn paused(env: &Env) {
+    Paused {}.publish(env);
+}
+
+pub fn unpaused(env: &Env) {
+    Unpaused {}.publish(env);
 }
 
 pub fn project_funded(env: &Env, project_id: u32, amount: i128, recipient: &Address) {

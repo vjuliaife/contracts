@@ -71,6 +71,10 @@ pub enum VaultError {
     DepositBelowMinimum = 31,
     /// Withdraw shares amount is below the minimum allowed (MIN_WITHDRAW).
     WithdrawBelowMinimum = 32,
+    /// Slippage limit was exceeded during withdrawal.
+    SlippageLimitExceeded = 33,
+    /// The vault is currently paused.
+    Paused = 34,
 }
 
 #[contracttype]
@@ -79,6 +83,8 @@ pub enum VaultKey {
     UsdcSac,
     Registry,
     TotalInvestments,
+    CachedExpectedReturns,
+    CachedTotalAssets,
     ProjectInvestment(u32),
     /// Global yield-per-share accumulator, scaled by YIELD_SCALE (#125).
     YieldPerShareAccum,
@@ -124,14 +130,12 @@ pub enum VaultKey {
     ReportingSnapshot,
     /// Maximum transaction amount for compliance (0 = no limit).
     MaxTransactionAmount,
-    /// Cached expected returns (updated incrementally on fund_project).
-    CachedExpectedReturns,
-    /// Cached total vault assets (liquid + investments + expected returns).
-    CachedTotalAssets,
-    /// Multi-sig signer address list.
+    /// Multi-sig signers list.
     MultiSigSigners,
     /// Multi-sig approval threshold.
     MultiSigThreshold,
+    /// Circuit breaker pause state.
+    Paused,
 }
 
 /// Container for wormhole bridge data keys.
