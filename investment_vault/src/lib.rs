@@ -19,8 +19,7 @@ const YIELD_SCALE: i128 = 1_000_000_000_000_000_000; // 1e18
 /// Basis points deducted from each deposit as an insurance premium (#135).
 /// 50 bps = 0.5 % of deposit amount.
 const INSURANCE_PREMIUM_BPS: i128 = 50;
-/// Current schema version for instance and persistent contract state (#66).
-const STATE_VERSION: u32 = 1;
+const MAX_MULTISIG_SIGNERS: u32 = 10;
 
 mod events;
 mod types;
@@ -149,79 +148,25 @@ impl InvestmentVault {
     /// `ProjectRegistry`, not to an arbitrary address.
     #[only_owner]
     pub fn fund_project(env: Env, project_id: u32, amount: i128) {
-        require_current_state(&env);
-        if amount <= 0 {
-            panic_with_error!(&env, VaultError::AmountNotPositive);
+        require_multisig_disabled(&env);
+        fund_project_internal(env, project_id, amount);
+    }
+
+    pub fn fund_project_with_approvals(
+        env: Env,
+        project_id: u32,
+        amount: i128,
+        approvals: Vec<Address>,
+    ) {
+        require_admin_approval(&env, approvals);
+        fund_project_internal(env, project_id, amount);
+    }
+
+    pub fn batch_fund_projects(env: Env, fundings: Vec<(u32, i128)>, approvals: Vec<Address>) {
+        require_admin_approval(&env, approvals);
+        for funding in fundings.iter() {
+            fund_project_internal(env.clone(), funding.0, funding.1);
         }
-
-        let registry_addr: Address = env.storage().instance().get(&VaultKey::Registry).unwrap();
-        let registry = registry_interface::Client::new(&env, &registry_addr);
-        let project = registry.get_project(&project_id);
-
-        // Enforce minimum quality thresholds before any USDC moves (#47).
-        // Comparison is >= so a threshold of 0 never blocks a project with score 0.
-        let min_credit: u32 = env
-            .storage()
-            .instance()
-            .get(&VaultKey::MinCreditQuality)
-            .unwrap_or(0);
-        let min_green: u32 = env
-            .storage()
-            .instance()
-            .get(&VaultKey::MinGreenImpact)
-            .unwrap_or(0);
-        if project.credit_quality < min_credit {
-            panic_with_error!(&env, VaultError::BelowMinCreditQuality);
-        }
-        if project.green_impact < min_green {
-            panic_with_error!(&env, VaultError::BelowMinGreenImpact);
-        }
-
-        let usdc_sac: Address = env.storage().instance().get(&VaultKey::UsdcSac).unwrap();
-        let liquid = soroban_sdk::token::TokenClient::new(&env, &usdc_sac)
-            .balance(&env.current_contract_address());
-
-        // Reserve the insurance fund — it must never be used for project funding (#113).
-        // Reading and subtracting here means concurrent fund_project calls in different
-        // transactions each see the current on-chain balance, so no double-spend is possible
-        // (Soroban transactions are serialised per ledger). The explicit reserve check
-        // prevents the admin from accidentally draining USDC that belongs to the fund.
-        let insurance_reserve: i128 = env
-            .storage()
-            .persistent()
-            .get(&VaultKey::InsuranceFund)
-            .unwrap_or(0);
-        let available = liquid - insurance_reserve;
-
-        if amount > available {
-            panic_with_error!(&env, VaultError::InsufficientDeployable);
-        }
-
-        soroban_sdk::token::TokenClient::new(&env, &usdc_sac).transfer(
-            &env.current_contract_address(),
-            &project.owner,
-            &amount,
-        );
-
-        let prev: i128 = env
-            .storage()
-            .persistent()
-            .get(&VaultKey::ProjectInvestment(project_id))
-            .unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&VaultKey::ProjectInvestment(project_id), &(prev + amount));
-
-        let total_inv: i128 = env
-            .storage()
-            .persistent()
-            .get(&VaultKey::TotalInvestments)
-            .unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&VaultKey::TotalInvestments, &(total_inv + amount));
-
-        events::project_funded(&env, project_id, amount, &project.owner);
     }
 
     /// Estimate the expected yield from all funded projects based on their impact scores.
@@ -366,6 +311,14 @@ impl InvestmentVault {
         events::deposit(&env, &from, usdc_amount, shares);
 
         shares
+    }
+
+    pub fn batch_deposit(env: Env, deposits: Vec<(Address, i128)>) -> Vec<i128> {
+        let mut minted = Vec::new(&env);
+        for deposit in deposits.iter() {
+            minted.push_back(Self::deposit(env.clone(), deposit.0, deposit.1));
+        }
+        minted
     }
 
     /// Return the vault utilization in basis points:
@@ -529,34 +482,18 @@ impl InvestmentVault {
     /// Called by the owner when a project makes a repayment.
     #[only_owner]
     pub fn receive_yield(env: Env, from: Address, amount: i128) {
-        require_current_state(&env);
-        if amount <= 0 {
-            panic_with_error!(&env, VaultError::YieldAmountNotPositive);
-        }
-        let total_shares = Base::total_supply(&env);
-        if total_shares == 0 {
-            panic_with_error!(&env, VaultError::NoSharesOutstanding);
-        }
+        require_multisig_disabled(&env);
+        receive_yield_internal(env, from, amount);
+    }
 
-        let usdc_sac: Address = env.storage().instance().get(&VaultKey::UsdcSac).unwrap();
-        soroban_sdk::token::TokenClient::new(&env, &usdc_sac).transfer(
-            &from,
-            env.current_contract_address(),
-            &amount,
-        );
-
-        // Increase global accumulator: delta = amount * YIELD_SCALE / total_shares
-        let delta = amount * YIELD_SCALE / total_shares;
-        let accum: i128 = env
-            .storage()
-            .persistent()
-            .get(&VaultKey::YieldPerShareAccum)
-            .unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&VaultKey::YieldPerShareAccum, &(accum + delta));
-
-        events::yield_received(&env, &from, amount);
+    pub fn receive_yield_with_approvals(
+        env: Env,
+        from: Address,
+        amount: i128,
+        approvals: Vec<Address>,
+    ) {
+        require_admin_approval(&env, approvals);
+        receive_yield_internal(env, from, amount);
     }
 
     /// Return the USDC yield claimable by `account` without modifying state.
@@ -676,42 +613,54 @@ impl InvestmentVault {
     /// Transfers `amount` from the insurance fund to `recipient`.
     #[only_owner]
     pub fn claim_insurance(env: Env, project_id: u32, recipient: Address, amount: i128) {
-        require_current_state(&env);
-        if amount <= 0 {
-            panic_with_error!(&env, VaultError::ClaimAmountNotPositive);
-        }
-        let already_claimed: bool = env
+        require_multisig_disabled(&env);
+        claim_insurance_internal(env, project_id, recipient, amount);
+    }
+
+    pub fn claim_insurance_with_approvals(
+        env: Env,
+        project_id: u32,
+        recipient: Address,
+        amount: i128,
+        approvals: Vec<Address>,
+    ) {
+        require_admin_approval(&env, approvals);
+        claim_insurance_internal(env, project_id, recipient, amount);
+    }
+
+    #[only_owner]
+    pub fn set_multisig_admin(env: Env, signers: Vec<Address>, threshold: u32) {
+        validate_multisig_config(&env, &signers, threshold);
+        env.storage()
+            .instance()
+            .set(&VaultKey::MultiSigSigners, &signers);
+        env.storage()
+            .instance()
+            .set(&VaultKey::MultiSigThreshold, &threshold);
+    }
+
+    #[only_owner]
+    pub fn clear_multisig_admin(env: Env) {
+        env.storage()
+            .instance()
+            .set(&VaultKey::MultiSigThreshold, &0u32);
+        env.storage()
+            .instance()
+            .set(&VaultKey::MultiSigSigners, &Vec::<Address>::new(&env));
+    }
+
+    pub fn get_multisig_admin(env: Env) -> (Vec<Address>, u32) {
+        let signers = env
             .storage()
-            .persistent()
-            .get(&VaultKey::InsuranceClaimed(project_id))
-            .unwrap_or(false);
-        if already_claimed {
-            panic_with_error!(&env, VaultError::InsuranceAlreadyClaimed);
-        }
-        let fund: i128 = env
+            .instance()
+            .get(&VaultKey::MultiSigSigners)
+            .unwrap_or_else(|| Vec::new(&env));
+        let threshold = env
             .storage()
-            .persistent()
-            .get(&VaultKey::InsuranceFund)
+            .instance()
+            .get(&VaultKey::MultiSigThreshold)
             .unwrap_or(0);
-        if amount > fund {
-            panic_with_error!(&env, VaultError::InsufficientInsurance);
-        }
-        // Mark as claimed before transfer (CEI)
-        env.storage()
-            .persistent()
-            .set(&VaultKey::InsuranceClaimed(project_id), &true);
-        env.storage()
-            .persistent()
-            .set(&VaultKey::InsuranceFund, &(fund - amount));
-
-        let usdc_sac: Address = env.storage().instance().get(&VaultKey::UsdcSac).unwrap();
-        soroban_sdk::token::TokenClient::new(&env, &usdc_sac).transfer(
-            &env.current_contract_address(),
-            &recipient,
-            &amount,
-        );
-
-        events::insurance_claimed(&env, project_id, &recipient, amount);
+        (signers, threshold)
     }
 
     // ── Multi-asset configuration (#133) ──────────────────────────────────────
@@ -809,11 +758,6 @@ impl InvestmentVault {
         if min_credit_quality > 100 || min_green_impact > 100 {
             panic_with_error!(&env, VaultError::ThresholdOutOfRange);
         }
-        if Self::get_min_credit_quality(env.clone()) == min_credit_quality
-            && Self::get_min_green_impact(env.clone()) == min_green_impact
-        {
-            return;
-        }
         env.storage()
             .instance()
             .set(&VaultKey::MinCreditQuality, &min_credit_quality);
@@ -825,7 +769,6 @@ impl InvestmentVault {
 
     /// Return the minimum credit quality threshold (0–100). Default is 0 (no restriction).
     pub fn get_min_credit_quality(env: Env) -> u32 {
-        require_current_state(&env);
         env.storage()
             .instance()
             .get(&VaultKey::MinCreditQuality)
@@ -834,7 +777,6 @@ impl InvestmentVault {
 
     /// Return the minimum green impact threshold (0–100). Default is 0 (no restriction).
     pub fn get_min_green_impact(env: Env) -> u32 {
-        require_current_state(&env);
         env.storage()
             .instance()
             .get(&VaultKey::MinGreenImpact)
@@ -857,10 +799,6 @@ impl InvestmentVault {
     pub fn set_registry(env: Env, new_registry: Address) {
         require_current_state(&env);
         let old: Address = env.storage().instance().get(&VaultKey::Registry).unwrap();
-        if old == new_registry {
-            return;
-        }
-        registry_interface::Client::new(&env, &new_registry).total_projects();
         env.storage()
             .instance()
             .set(&VaultKey::Registry, &new_registry);
@@ -932,7 +870,6 @@ impl InvestmentVault {
 
     #[only_owner]
     pub fn set_wormhole_core(env: Env, core: Address) {
-        require_current_state(&env);
         env.storage()
             .instance()
             .set(&BridgeDataKey::WormholeCore, &core);
@@ -945,7 +882,6 @@ impl InvestmentVault {
         emitter_address: BytesN<32>,
         trusted: bool,
     ) {
-        require_current_state(&env);
         env.storage().persistent().set(
             &BridgeDataKey::TrustedEmitter(chain_id, emitter_address),
             &trusted,
@@ -1039,7 +975,6 @@ impl InvestmentVault {
 
     #[only_owner]
     pub fn set_flash_loan_fee(env: Env, fee_bps: i128) {
-        require_current_state(&env);
         if !(0..=1000).contains(&fee_bps) {
             panic!("fee must be 0-1000 bps (0%-10%)");
         }
@@ -1143,7 +1078,6 @@ impl InvestmentVault {
         project_id: u32,
         amount: i128,
     ) -> CarbonCreditCalculation {
-        require_current_state(&env);
         let registry_addr: Address = env.storage().instance().get(&VaultKey::Registry).unwrap();
         let registry = registry_interface::Client::new(&env, &registry_addr);
         let project = registry.get_project(&project_id);
@@ -1376,16 +1310,216 @@ impl InvestmentVault {
     }
 }
 
-fn read_state_version(env: &Env) -> u32 {
-    env.storage()
+fn fund_project_internal(env: Env, project_id: u32, amount: i128) {
+    if amount <= 0 {
+        panic_with_error!(&env, VaultError::AmountNotPositive);
+    }
+
+    let registry_addr: Address = env.storage().instance().get(&VaultKey::Registry).unwrap();
+    let registry = registry_interface::Client::new(&env, &registry_addr);
+    let project = registry.get_project(&project_id);
+
+    let min_credit: u32 = env
+        .storage()
         .instance()
-        .get(&VaultKey::StateVersion)
-        .unwrap_or(0)
+        .get(&VaultKey::MinCreditQuality)
+        .unwrap_or(0);
+    let min_green: u32 = env
+        .storage()
+        .instance()
+        .get(&VaultKey::MinGreenImpact)
+        .unwrap_or(0);
+    if project.credit_quality < min_credit {
+        panic_with_error!(&env, VaultError::BelowMinCreditQuality);
+    }
+    if project.green_impact < min_green {
+        panic_with_error!(&env, VaultError::BelowMinGreenImpact);
+    }
+
+    let usdc_sac: Address = env.storage().instance().get(&VaultKey::UsdcSac).unwrap();
+    let liquid = soroban_sdk::token::TokenClient::new(&env, &usdc_sac)
+        .balance(&env.current_contract_address());
+
+    let insurance_reserve: i128 = env
+        .storage()
+        .persistent()
+        .get(&VaultKey::InsuranceFund)
+        .unwrap_or(0);
+    let available = liquid - insurance_reserve;
+
+    if amount > available {
+        panic_with_error!(&env, VaultError::InsufficientDeployable);
+    }
+
+    soroban_sdk::token::TokenClient::new(&env, &usdc_sac).transfer(
+        &env.current_contract_address(),
+        &project.owner,
+        &amount,
+    );
+
+    let prev: i128 = env
+        .storage()
+        .persistent()
+        .get(&VaultKey::ProjectInvestment(project_id))
+        .unwrap_or(0);
+    env.storage()
+        .persistent()
+        .set(&VaultKey::ProjectInvestment(project_id), &(prev + amount));
+
+    let total_inv: i128 = env
+        .storage()
+        .persistent()
+        .get(&VaultKey::TotalInvestments)
+        .unwrap_or(0);
+    env.storage()
+        .persistent()
+        .set(&VaultKey::TotalInvestments, &(total_inv + amount));
+
+    events::project_funded(&env, project_id, amount, &project.owner);
 }
 
-fn require_current_state(env: &Env) {
-    if read_state_version(env) != STATE_VERSION {
-        panic_with_error!(env, VaultError::UnsupportedStateVersion);
+fn receive_yield_internal(env: Env, from: Address, amount: i128) {
+    if amount <= 0 {
+        panic_with_error!(&env, VaultError::YieldAmountNotPositive);
+    }
+    let total_shares = Base::total_supply(&env);
+    if total_shares == 0 {
+        panic_with_error!(&env, VaultError::NoSharesOutstanding);
+    }
+
+    let usdc_sac: Address = env.storage().instance().get(&VaultKey::UsdcSac).unwrap();
+    soroban_sdk::token::TokenClient::new(&env, &usdc_sac).transfer(
+        &from,
+        env.current_contract_address(),
+        &amount,
+    );
+
+    let delta = amount * YIELD_SCALE / total_shares;
+    let accum: i128 = env
+        .storage()
+        .persistent()
+        .get(&VaultKey::YieldPerShareAccum)
+        .unwrap_or(0);
+    env.storage()
+        .persistent()
+        .set(&VaultKey::YieldPerShareAccum, &(accum + delta));
+
+    events::yield_received(&env, &from, amount);
+}
+
+fn claim_insurance_internal(env: Env, project_id: u32, recipient: Address, amount: i128) {
+    if amount <= 0 {
+        panic_with_error!(&env, VaultError::ClaimAmountNotPositive);
+    }
+    let already_claimed: bool = env
+        .storage()
+        .persistent()
+        .get(&VaultKey::InsuranceClaimed(project_id))
+        .unwrap_or(false);
+    if already_claimed {
+        panic_with_error!(&env, VaultError::InsuranceAlreadyClaimed);
+    }
+    let fund: i128 = env
+        .storage()
+        .persistent()
+        .get(&VaultKey::InsuranceFund)
+        .unwrap_or(0);
+    if amount > fund {
+        panic_with_error!(&env, VaultError::InsufficientInsurance);
+    }
+
+    env.storage()
+        .persistent()
+        .set(&VaultKey::InsuranceClaimed(project_id), &true);
+    env.storage()
+        .persistent()
+        .set(&VaultKey::InsuranceFund, &(fund - amount));
+
+    let usdc_sac: Address = env.storage().instance().get(&VaultKey::UsdcSac).unwrap();
+    soroban_sdk::token::TokenClient::new(&env, &usdc_sac).transfer(
+        &env.current_contract_address(),
+        &recipient,
+        &amount,
+    );
+
+    events::insurance_claimed(&env, project_id, &recipient, amount);
+}
+
+fn validate_multisig_config(env: &Env, signers: &Vec<Address>, threshold: u32) {
+    if signers.len() > MAX_MULTISIG_SIGNERS {
+        panic_with_error!(env, VaultError::TooManyMultiSigSigners);
+    }
+    if threshold == 0 || threshold > signers.len() {
+        panic_with_error!(env, VaultError::InvalidMultiSigThreshold);
+    }
+    for i in 0..signers.len() {
+        let signer = signers.get(i).unwrap();
+        for j in (i + 1)..signers.len() {
+            if signer == signers.get(j).unwrap() {
+                panic_with_error!(env, VaultError::DuplicateApproval);
+            }
+        }
+    }
+}
+
+fn require_admin_approval(env: &Env, approvals: Vec<Address>) {
+    let threshold: u32 = env
+        .storage()
+        .instance()
+        .get(&VaultKey::MultiSigThreshold)
+        .unwrap_or(0);
+    if threshold == 0 {
+        stellar_access::ownable::get_owner(env)
+            .unwrap()
+            .require_auth();
+        return;
+    }
+
+    let signers: Vec<Address> = env
+        .storage()
+        .instance()
+        .get(&VaultKey::MultiSigSigners)
+        .unwrap_or_else(|| Vec::new(env));
+    if threshold > signers.len() {
+        panic_with_error!(env, VaultError::InvalidMultiSigThreshold);
+    }
+
+    let mut approved = 0u32;
+    for i in 0..approvals.len() {
+        let approver = approvals.get(i).unwrap();
+        for j in 0..i {
+            if approver == approvals.get(j).unwrap() {
+                panic_with_error!(env, VaultError::DuplicateApproval);
+            }
+        }
+
+        let mut is_signer = false;
+        for signer in signers.iter() {
+            if approver == signer {
+                is_signer = true;
+                break;
+            }
+        }
+        if !is_signer {
+            panic_with_error!(env, VaultError::NotMultiSigSigner);
+        }
+        approver.require_auth();
+        approved += 1;
+    }
+
+    if approved < threshold {
+        panic_with_error!(env, VaultError::InsufficientApprovals);
+    }
+}
+
+fn require_multisig_disabled(env: &Env) {
+    let threshold: u32 = env
+        .storage()
+        .instance()
+        .get(&VaultKey::MultiSigThreshold)
+        .unwrap_or(0);
+    if threshold > 0 {
+        panic_with_error!(env, VaultError::InsufficientApprovals);
     }
 }
 

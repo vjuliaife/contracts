@@ -17,6 +17,7 @@ const STATE_VERSION: u32 = 1;
 const BASE_RATE_BPS: u32 = 1_000;
 /// Maximum rate discount in basis points earned by a perfect-score project (5 %) (#129).
 const MAX_DISCOUNT_BPS: u32 = 500;
+const MAX_MULTISIG_SIGNERS: u32 = 10;
 
 mod events;
 mod types;
@@ -181,44 +182,19 @@ impl ProjectRegistry {
     /// No-op if the new scores are identical to the existing ones.
     #[only_owner]
     pub fn update_impact_score(env: Env, project_id: u32, credit_quality: u32, green_impact: u32) {
-        require_current_state(&env);
-        if credit_quality > 100 || green_impact > 100 {
-            panic_with_error!(&env, RegistryError::ScoresOutOfRange);
-        }
-        let mut project: ProjectData = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Project(project_id))
-            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::ProjectNotFound));
+        require_multisig_disabled(&env);
+        update_impact_score_internal(env, project_id, credit_quality, green_impact);
+    }
 
-        // Skip write and event if scores are identical (#124)
-        if project.credit_quality == credit_quality && project.green_impact == green_impact {
-            return;
-        }
-
-        let old_cq = project.credit_quality;
-        let old_gi = project.green_impact;
-        let old_rate = compute_rate(old_cq, old_gi);
-
-        project.credit_quality = credit_quality;
-        project.green_impact = green_impact;
-        let new_rate = compute_rate(credit_quality, green_impact);
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Project(project_id), &project);
-        events::project_updated(&env, project_id, credit_quality, green_impact);
-        events::rate_updated(&env, project_id, new_rate);
-        events::score_changed(
-            &env,
-            project_id,
-            old_cq,
-            credit_quality,
-            old_gi,
-            green_impact,
-            old_rate,
-            new_rate,
-        );
+    pub fn update_impact_score_approved(
+        env: Env,
+        project_id: u32,
+        credit_quality: u32,
+        green_impact: u32,
+        approvals: Vec<Address>,
+    ) {
+        require_admin_approval(&env, approvals);
+        update_impact_score_internal(env, project_id, credit_quality, green_impact);
     }
 
     /// Set the certification status of a project (whitelister or owner only) (#130).
@@ -228,7 +204,6 @@ impl ProjectRegistry {
         project_id: u32,
         status: CertificationStatus,
     ) {
-        require_current_state(&env);
         caller.require_auth();
         let whitelister: Address = env.storage().instance().get(&DataKey::Whitelister).unwrap();
         let owner: Address = stellar_access::ownable::get_owner(&env).unwrap();
@@ -401,35 +376,18 @@ impl ProjectRegistry {
     /// update both scores simultaneously (#6).
     #[only_owner]
     pub fn update_credit_quality_score(env: Env, project_id: u32, credit_quality: u32) {
-        require_current_state(&env);
-        if credit_quality > 100 {
-            panic_with_error!(&env, RegistryError::CreditQualityOutOfRange);
-        }
-        let mut project: ProjectData = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Project(project_id))
-            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::ProjectNotFound));
-        if project.credit_quality == credit_quality {
-            return;
-        }
-        let old_cq = project.credit_quality;
-        let old_rate = compute_rate(old_cq, project.green_impact);
-        project.credit_quality = credit_quality;
-        let new_rate = compute_rate(credit_quality, project.green_impact);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Project(project_id), &project);
-        events::score_changed(
-            &env,
-            project_id,
-            old_cq,
-            credit_quality,
-            project.green_impact,
-            project.green_impact,
-            old_rate,
-            new_rate,
-        );
+        require_multisig_disabled(&env);
+        update_credit_quality_score_internal(env, project_id, credit_quality);
+    }
+
+    pub fn update_credit_quality_approved(
+        env: Env,
+        project_id: u32,
+        credit_quality: u32,
+        approvals: Vec<Address>,
+    ) {
+        require_admin_approval(&env, approvals);
+        update_credit_quality_score_internal(env, project_id, credit_quality);
     }
 
     /// Return a proposal by ID. Panics with `ProposalNotFound` if unknown.
@@ -521,21 +479,54 @@ impl ProjectRegistry {
     /// Liquidate collateral to `recipient` (admin only). Used for defaulted projects.
     #[only_owner]
     pub fn liquidate_collateral(env: Env, project_id: u32, token: Address, recipient: Address) {
-        require_current_state(&env);
-        let key = DataKey::Collateral(project_id, token.clone());
-        let balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        if balance <= 0 {
-            panic_with_error!(&env, RegistryError::NoCollateral);
-        }
+        require_multisig_disabled(&env);
+        liquidate_collateral_internal(env, project_id, token, recipient);
+    }
 
-        env.storage().persistent().set(&key, &0i128);
-        TokenClient::new(&env, &token).transfer(
-            &env.current_contract_address(),
-            &recipient,
-            &balance,
-        );
+    pub fn liquidate_collateral_approved(
+        env: Env,
+        project_id: u32,
+        token: Address,
+        recipient: Address,
+        approvals: Vec<Address>,
+    ) {
+        require_admin_approval(&env, approvals);
+        liquidate_collateral_internal(env, project_id, token, recipient);
+    }
 
-        events::collateral_liquidated(&env, project_id, &token, &recipient, balance);
+    #[only_owner]
+    pub fn set_multisig_admin(env: Env, signers: Vec<Address>, threshold: u32) {
+        validate_multisig_config(&env, &signers, threshold);
+        env.storage()
+            .instance()
+            .set(&DataKey::MultiSigSigners, &signers);
+        env.storage()
+            .instance()
+            .set(&DataKey::MultiSigThreshold, &threshold);
+    }
+
+    #[only_owner]
+    pub fn clear_multisig_admin(env: Env) {
+        env.storage()
+            .instance()
+            .set(&DataKey::MultiSigThreshold, &0u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::MultiSigSigners, &Vec::<Address>::new(&env));
+    }
+
+    pub fn get_multisig_admin(env: Env) -> (Vec<Address>, u32) {
+        let signers = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigSigners)
+            .unwrap_or_else(|| Vec::new(&env));
+        let threshold = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigThreshold)
+            .unwrap_or(0);
+        (signers, threshold)
     }
 
     // ── Interest rate (#129) ───────────────────────────────────────────────────
@@ -611,9 +602,6 @@ impl ProjectRegistry {
     pub fn set_whitelister(env: Env, new_whitelister: Address) {
         require_current_state(&env);
         let old: Address = env.storage().instance().get(&DataKey::Whitelister).unwrap();
-        if old == new_whitelister {
-            return;
-        }
         env.storage()
             .instance()
             .set(&DataKey::Whitelister, &new_whitelister);
@@ -627,16 +615,162 @@ impl ProjectRegistry {
     }
 }
 
-fn read_state_version(env: &Env) -> u32 {
+fn update_impact_score_internal(env: Env, project_id: u32, credit_quality: u32, green_impact: u32) {
+    if credit_quality > 100 || green_impact > 100 {
+        panic_with_error!(&env, RegistryError::ScoresOutOfRange);
+    }
+    let mut project: ProjectData = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Project(project_id))
+        .unwrap_or_else(|| panic_with_error!(&env, RegistryError::ProjectNotFound));
+
+    if project.credit_quality == credit_quality && project.green_impact == green_impact {
+        return;
+    }
+
+    let old_cq = project.credit_quality;
+    let old_gi = project.green_impact;
+    let old_rate = compute_rate(old_cq, old_gi);
+
+    project.credit_quality = credit_quality;
+    project.green_impact = green_impact;
+    let new_rate = compute_rate(credit_quality, green_impact);
+
     env.storage()
-        .instance()
-        .get(&DataKey::StateVersion)
-        .unwrap_or(0)
+        .persistent()
+        .set(&DataKey::Project(project_id), &project);
+    events::project_updated(&env, project_id, credit_quality, green_impact);
+    events::rate_updated(&env, project_id, new_rate);
+    events::score_changed(
+        &env,
+        project_id,
+        old_cq,
+        credit_quality,
+        old_gi,
+        green_impact,
+        old_rate,
+        new_rate,
+    );
 }
 
-fn require_current_state(env: &Env) {
-    if read_state_version(env) != STATE_VERSION {
-        panic_with_error!(env, RegistryError::UnsupportedStateVersion);
+fn update_credit_quality_score_internal(env: Env, project_id: u32, credit_quality: u32) {
+    if credit_quality > 100 {
+        panic_with_error!(&env, RegistryError::CreditQualityOutOfRange);
+    }
+    let mut project: ProjectData = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Project(project_id))
+        .unwrap_or_else(|| panic_with_error!(&env, RegistryError::ProjectNotFound));
+    let old_cq = project.credit_quality;
+    let old_rate = compute_rate(project.credit_quality, project.green_impact);
+    project.credit_quality = credit_quality;
+    let new_rate = compute_rate(credit_quality, project.green_impact);
+    env.storage()
+        .persistent()
+        .set(&DataKey::Project(project_id), &project);
+    events::credit_quality_updated(&env, project_id, credit_quality);
+    events::score_changed(
+        &env,
+        project_id,
+        old_cq,
+        credit_quality,
+        project.green_impact,
+        project.green_impact,
+        old_rate,
+        new_rate,
+    );
+}
+
+fn liquidate_collateral_internal(env: Env, project_id: u32, token: Address, recipient: Address) {
+    let key = DataKey::Collateral(project_id, token.clone());
+    let balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+    if balance <= 0 {
+        panic_with_error!(&env, RegistryError::NoCollateral);
+    }
+
+    env.storage().persistent().set(&key, &0i128);
+    TokenClient::new(&env, &token).transfer(&env.current_contract_address(), &recipient, &balance);
+
+    events::collateral_liquidated(&env, project_id, &token, &recipient, balance);
+}
+
+fn validate_multisig_config(env: &Env, signers: &Vec<Address>, threshold: u32) {
+    if signers.len() > MAX_MULTISIG_SIGNERS {
+        panic_with_error!(env, RegistryError::TooManyMultiSigSigners);
+    }
+    if threshold == 0 || threshold > signers.len() {
+        panic_with_error!(env, RegistryError::InvalidMultiSigThreshold);
+    }
+    for i in 0..signers.len() {
+        let signer = signers.get(i).unwrap();
+        for j in (i + 1)..signers.len() {
+            if signer == signers.get(j).unwrap() {
+                panic_with_error!(env, RegistryError::DuplicateApproval);
+            }
+        }
+    }
+}
+
+fn require_admin_approval(env: &Env, approvals: Vec<Address>) {
+    let threshold: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::MultiSigThreshold)
+        .unwrap_or(0);
+    if threshold == 0 {
+        stellar_access::ownable::get_owner(env)
+            .unwrap()
+            .require_auth();
+        return;
+    }
+
+    let signers: Vec<Address> = env
+        .storage()
+        .instance()
+        .get(&DataKey::MultiSigSigners)
+        .unwrap_or_else(|| Vec::new(env));
+    if threshold > signers.len() {
+        panic_with_error!(env, RegistryError::InvalidMultiSigThreshold);
+    }
+
+    let mut approved = 0u32;
+    for i in 0..approvals.len() {
+        let approver = approvals.get(i).unwrap();
+        for j in 0..i {
+            if approver == approvals.get(j).unwrap() {
+                panic_with_error!(env, RegistryError::DuplicateApproval);
+            }
+        }
+
+        let mut is_signer = false;
+        for signer in signers.iter() {
+            if approver == signer {
+                is_signer = true;
+                break;
+            }
+        }
+        if !is_signer {
+            panic_with_error!(env, RegistryError::NotMultiSigSigner);
+        }
+        approver.require_auth();
+        approved += 1;
+    }
+
+    if approved < threshold {
+        panic_with_error!(env, RegistryError::InsufficientApprovals);
+    }
+}
+
+fn require_multisig_disabled(env: &Env) {
+    let threshold: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::MultiSigThreshold)
+        .unwrap_or(0);
+    if threshold > 0 {
+        panic_with_error!(env, RegistryError::InsufficientApprovals);
     }
 }
 

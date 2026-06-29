@@ -53,8 +53,16 @@ pub enum VaultError {
     EmitterNotTrusted = 22,
     /// VAA has already been consumed.
     VaaAlreadyConsumed = 23,
-    /// Stored state version is missing, unsupported, or newer than this code.
-    UnsupportedStateVersion = 24,
+    /// Multi-sig threshold must be greater than 0 and no larger than signer count.
+    InvalidMultiSigThreshold = 24,
+    /// Multi-sig signer set is larger than the contract limit.
+    TooManyMultiSigSigners = 25,
+    /// Approval address is not configured as a multi-sig signer.
+    NotMultiSigSigner = 26,
+    /// Approval set contains the same signer more than once.
+    DuplicateApproval = 27,
+    /// The operation did not include enough multi-sig approvals.
+    InsufficientApprovals = 28,
 }
 
 #[contracttype]
@@ -108,6 +116,10 @@ pub enum VaultKey {
     ReportingSnapshot,
     /// Maximum transaction amount for compliance (0 = no limit).
     MaxTransactionAmount,
+    /// Configured multi-sig signer set for critical admin operations (#69).
+    MultiSigSigners,
+    /// Number of approvals required from MultiSigSigners. 0 disables multi-sig.
+    MultiSigThreshold,
 }
 
 /// Container for wormhole bridge data keys.

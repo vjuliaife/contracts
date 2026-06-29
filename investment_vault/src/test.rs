@@ -1,6 +1,6 @@
 #![cfg(test)]
 #![allow(clippy::inconsistent_digit_grouping)]
-
+extern crate std;
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Events as _},
@@ -8,7 +8,6 @@ use soroban_sdk::{
     token::TokenClient,
     Address, Env, IntoVal, String,
 };
-extern crate std;
 
 mod registry_contract {
     soroban_sdk::contractimport!(file = "../target/wasm32v1-none/release/project_registry.wasm");
@@ -127,6 +126,121 @@ fn test_total_assets_after_deposit() {
     mint_usdc(&s.env, &s.usdc_sac, &investor, 500_0000000i128);
     s.vault_client.deposit(&investor, &500_0000000i128);
     assert_eq!(s.vault_client.total_assets(), 500_0000000i128);
+}
+
+#[test]
+fn test_batch_deposit_mints_for_each_investor() {
+    let s = setup();
+    let investor1 = Address::generate(&s.env);
+    let investor2 = Address::generate(&s.env);
+    mint_usdc(&s.env, &s.usdc_sac, &investor1, 1_000_0000000i128);
+    mint_usdc(&s.env, &s.usdc_sac, &investor2, 500_0000000i128);
+
+    let deposits = soroban_sdk::vec![
+        &s.env,
+        (investor1.clone(), 1_000_0000000i128),
+        (investor2.clone(), 500_0000000i128)
+    ];
+    let minted = s.vault_client.batch_deposit(&deposits);
+
+    assert_eq!(minted.len(), 2);
+    assert!(minted.get(0).unwrap() > 0);
+    assert!(minted.get(1).unwrap() > 0);
+    assert_eq!(s.vault_client.balance(&investor1), minted.get(0).unwrap());
+    assert_eq!(s.vault_client.balance(&investor2), minted.get(1).unwrap());
+}
+
+#[test]
+fn test_multisig_batch_fund_projects() {
+    let s = setup();
+    let signer1 = Address::generate(&s.env);
+    let signer2 = Address::generate(&s.env);
+    let signer3 = Address::generate(&s.env);
+    let investor = Address::generate(&s.env);
+    let creator1 = Address::generate(&s.env);
+    let creator2 = Address::generate(&s.env);
+
+    s.vault_client.set_multisig_admin(
+        &soroban_sdk::vec![&s.env, signer1.clone(), signer2.clone(), signer3],
+        &2u32,
+    );
+    mint_usdc(&s.env, &s.usdc_sac, &investor, 2_000_0000000i128);
+    s.vault_client.deposit(&investor, &2_000_0000000i128);
+
+    let registry_client = registry_contract::Client::new(&s.env, &s.registry);
+    registry_client.set_whitelist(&creator1, &true);
+    registry_client.set_whitelist(&creator2, &true);
+    let project1 = registry_client.create_project(
+        &creator1,
+        &String::from_str(&s.env, "ipfs://QmBatchFund1"),
+        &0u64,
+    );
+    let project2 = registry_client.create_project(
+        &creator2,
+        &String::from_str(&s.env, "ipfs://QmBatchFund2"),
+        &0u64,
+    );
+
+    s.vault_client.batch_fund_projects(
+        &soroban_sdk::vec![
+            &s.env,
+            (project1, 100_0000000i128),
+            (project2, 150_0000000i128)
+        ],
+        &soroban_sdk::vec![&s.env, signer1, signer2],
+    );
+
+    assert!(s.vault_client.total_assets() > 0);
+}
+
+#[test]
+#[should_panic]
+fn test_multisig_rejects_insufficient_funding_approvals() {
+    let s = setup();
+    let signer1 = Address::generate(&s.env);
+    let signer2 = Address::generate(&s.env);
+    s.vault_client
+        .set_multisig_admin(&soroban_sdk::vec![&s.env, signer1.clone(), signer2], &2u32);
+
+    s.vault_client.batch_fund_projects(
+        &Vec::<(u32, i128)>::new(&s.env),
+        &soroban_sdk::vec![&s.env, signer1],
+    );
+}
+
+#[test]
+fn bench_vault_deposit() {
+    let s = setup();
+    let investor = Address::generate(&s.env);
+    mint_usdc(&s.env, &s.usdc_sac, &investor, 1_000_0000000i128);
+
+    s.vault_client.deposit(&investor, &1_000_0000000i128);
+
+    let instructions = s.env.cost_estimate().resources().instructions;
+    std::println!("bench_vault_deposit: {} instructions", instructions);
+    assert!(instructions <= 60_000_000);
+}
+
+#[test]
+fn bench_vault_batch_deposit_two_accounts() {
+    let s = setup();
+    let investor1 = Address::generate(&s.env);
+    let investor2 = Address::generate(&s.env);
+    mint_usdc(&s.env, &s.usdc_sac, &investor1, 1_000_0000000i128);
+    mint_usdc(&s.env, &s.usdc_sac, &investor2, 1_000_0000000i128);
+
+    s.vault_client.batch_deposit(&soroban_sdk::vec![
+        &s.env,
+        (investor1, 1_000_0000000i128),
+        (investor2, 1_000_0000000i128)
+    ]);
+
+    let instructions = s.env.cost_estimate().resources().instructions;
+    std::println!(
+        "bench_vault_batch_deposit_two_accounts: {} instructions",
+        instructions
+    );
+    assert!(instructions <= 100_000_000);
 }
 
 #[test]
@@ -603,11 +717,9 @@ fn test_withdraw_enqueues_when_insufficient_liquidity() {
     // Shares are worth ~1000 USDC but only ~510 USDC is liquid — should enqueue.
     let returned = s.vault_client.withdraw(&investor, &shares);
 
-    // Queued, not immediate.
-    assert_eq!(returned, 0);
-    // Shares burned at enqueue.
-    assert_eq!(s.vault_client.balance(&investor), 0);
-    // Investor still has no USDC (claim not settled yet)
+    assert_eq!(returned, 0); // queued, not immediate
+    assert_eq!(s.vault_client.balance(&investor), 0); // shares burned at enqueue
+                                                      // Investor still has no USDC (claim not settled yet)
     assert_eq!(TokenClient::new(&s.env, &s.usdc_sac).balance(&investor), 0);
 }
 
